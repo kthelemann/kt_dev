@@ -1,0 +1,249 @@
+create or replace table product.user_facts_refactor as (
+  with all_u AS (SELECT id AS userid,
+          ORGID,
+          dateadd(MS, coalesce(try_cast(to_char(raw_json:updatedat) AS number), try_cast(to_char(raw_json:updatedAt) AS number),
+                               try_cast(to_char(raw_json:createdat) AS number),
+                               try_cast(to_char(raw_json:createdAt) AS number)), '1970-01-01') AS time,
+          raw_json:status AS user_status,
+          raw_json:role AS user_type,
+          null AS video_user,
+          null AS chat_user,
+          null AS calendar_only_user
+   FROM public.users_all
+   WHERE ((raw_json:bot = 'false'
+           OR raw_json:bot = 'f')
+          OR raw_json:bot is NULL)),
+     scopes AS
+  (SELECT OBJECTID,
+          name,
+          value,
+          UPDATEDAT
+   FROM SEGMENT.PUBLIC.PROPERTIES_ALL
+   WHERE namespace = 'user-scopes'
+     AND OBJECTTYPE = 'USER'),
+      necessary_events AS (
+   SELECT
+      TRY_CAST(SPLIT_PART(USERID, '-', 2) AS INT) AS DRIFT_USERID
+    , CAST(MIN(PROPERTIES:email) AS varchar) AS EMAIL
+    , MIN(SENTAT) AS SENTAT
+   FROM SEGMENT.DRIFT_APP.EVENTS
+   WHERE EVENT IN ('Product Enabled')
+    AND PROPERTIES:product = 'video'
+    AND PROPERTIES:os not in ('iOS', 'Android')
+   GROUP BY 1
+  ),
+     product_enabled AS (
+   SELECT
+      DRIFT_USERID
+    , MIN(SENTAT) AS ENABLED_DATE
+   FROM NECESSARY_EVENTS
+    WHERE EMAIL NOT LIKE '%@drift.com'
+   GROUP BY 1
+   UNION
+   SELECT
+    TRY_CAST(SPLIT_PART(USER_ID, '-', 2) AS INT) AS DRIFT_USERID,
+    MIN(SENT_AT) AS ENABLED_DATE
+   FROM SEGMENT.DRIFT_MOBILE_IOS.PRODUCT_ENABLED
+    WHERE EMAIL NOT LIKE '%@drift.com'
+  GROUP BY 1
+   ),
+     video_changes_all as
+  (SELECT   OBJECTID
+          , dateadd(MS, UPDATEDAT, '1970-01-01') AS time
+          , NAME
+          , VALUE
+          , row_number() over (partition by OBJECTID order by time DESC) as RN
+   FROM scopes),
+     video_changes_limited as
+  (SELECT OBJECTID
+         , VALUE
+         , NAME
+   FROM video_changes_all
+   WHERE RN = 1),
+     video_users as
+  (SELECT   OBJECTID
+          , SUM(CASE
+                WHEN value in ('true','"true"')
+                      AND name = 'video'                then 1
+                WHEN ENABLED_DATE IS NOT NULL           then 1
+                WHEN value in ('false','"false"')       then -1
+                ELSE null END) as video_user
+  FROM video_changes_limited
+  RIGHT JOIN PRODUCT_ENABLED on PRODUCT_ENABLED.DRIFT_USERID = video_changes_limited.objectid
+  group by 1),
+     changes AS
+  (SELECT OBJECTID,
+          updatedat,
+          sum(CASE
+                  WHEN name in ('member', 'agent', 'org_admin')
+                       AND value in ('true','"true"') then 1
+                  WHEN name in ('member', 'agent', 'org_admin')
+                       AND value in ('false','"false"') then -1
+                  ELSE null
+              END) AS chat_user,
+          sum(CASE
+                  WHEN name = 'calendar_user'
+                       AND value in ('true','"true"') then 1
+                  WHEN name = 'calendar_user'
+                       AND value in ('false','"false"') then -1
+                  ELSE null
+              END) AS calendar_only_user
+   FROM scopes
+   GROUP BY 1,
+            2),
+     t AS
+  (SELECT C.OBJECTID AS userid,
+          null AS orgid,
+          dateadd(MS, UPDATEDAT, '1970-01-01') AS time,
+          null AS user_status,
+          null AS user_type,
+          CASE
+              WHEN video_user < 1 then false
+              WHEN video_user >= 1 then true
+              ELSE null
+          END AS video_user,
+          CASE
+              WHEN chat_user < 1 then false
+              WHEN chat_user = 1 then true
+              ELSE null
+          END AS chat_user,
+          CASE
+              WHEN calendar_only_user < 1 then false
+              WHEN calendar_only_user = 1 then true
+              ELSE null
+          END AS calendar_only_user
+   FROM changes C
+   LEFT JOIN video_users on video_users.objectid = c.objectid
+   ORDER BY updatedat),
+     uned AS
+  (SELECT *
+   FROM all_u
+   UNION all SELECT *
+   FROM t),
+     rowed AS
+  (SELECT userid,
+          time,
+          COALESCE(orgid, lag(orgid, 1)
+                   ignore nulls over (partition BY userid
+                                      ORDER BY time ASC)) AS orgid,
+          COALESCE(user_status, lag(user_status, 1)
+                   ignore nulls over (partition BY userid
+                                      ORDER BY time ASC)) AS user_status,
+          COALESCE(user_type, lag(user_type, 1)
+                   ignore nulls over (partition BY userid
+                                      ORDER BY time ASC)) AS user_type,
+          COALESCE(video_user, lag(video_user, 1)
+                   ignore nulls over (partition BY userid
+                                      ORDER BY time ASC)) AS video_user,
+          COALESCE(chat_user, lag(chat_user, 1)
+                   ignore nulls over (partition BY userid
+                                      ORDER BY time ASC)) AS chat_user,
+          COALESCE(calendar_only_user, lag(calendar_only_user, 1)
+                   ignore nulls over (partition BY userid
+                                      ORDER BY time ASC)) AS calendar_only_user,
+          row_number() over (partition BY userid, date_trunc(day, time)
+                             ORDER BY time DESC) rn
+   FROM uned
+   ORDER BY 1,
+            2),
+     rowed_1 AS
+  (SELECT userid,
+          date_trunc(day, time) AS date,
+          orgid,
+          user_status,
+          user_type,
+          COALESCE(video_user, false) AS video_user,
+          COALESCE(chat_user, false) AS chat_user,
+          COALESCE(calendar_only_user, false) AS calendar_only_user
+   FROM rowed
+   WHERE rn = 1
+     AND orgid is not null
+   ORDER BY date),
+     dts AS
+  (SELECT distinct r.userid,
+                   cal.date
+   FROM rowed_1 r
+   cross join SEGMENT.AGGREGATED.DIM_CALENDAR cal
+   WHERE cal.date >= '2016-01-01'),
+     inter AS
+  (SELECT d.userid,
+          d.date,
+          COALESCE(orgid, lag(orgid, 1)
+                 ignore nulls over (partition BY d.userid
+                                    ORDER BY d.date ASC)) AS orgid,
+          COALESCE(user_status, lag(user_status, 1)
+                   ignore nulls over (partition BY d.userid
+                                      ORDER BY d.date ASC)) AS user_status,
+          COALESCE(user_type, lag(user_type, 1)
+                   ignore nulls over (partition BY d.userid
+                                      ORDER BY d.date ASC)) AS user_type,
+          COALESCE(video_user, lag(video_user, 1)
+                   ignore nulls over (partition BY d.userid
+                                      ORDER BY d.date ASC)) AS video_user,
+          COALESCE(chat_user, lag(chat_user, 1)
+                   ignore nulls over (partition BY d.userid
+                                      ORDER BY d.date ASC)) AS chat_user,
+          COALESCE(calendar_only_user, lag(calendar_only_user, 1)
+                   ignore nulls over (partition BY d.userid
+                                      ORDER BY d.date ASC)) AS calendar_only_user
+   FROM dts d
+   left join rowed_1 r
+     ON d.userid = r.userid
+     AND d.date = r.date
+   WHERE d.date <= current_date()),
+     meeting_book_active_users AS
+  (SELECT CREATED_AT as date,
+          ATTRIBUTES:appointmentInfo:agentId AS userid,
+                                    count(distinct CONVERSATIONID)
+   FROM public.messages m
+   WHERE m.attributes like '%appointmentInfo%'
+     AND created_at >= dateadd('day', -29, current_date)
+   GROUP BY 1,
+            2)
+SELECT i.date::timestamp_ntz as date,
+       i.userid::number as userid,
+       i.orgid::number as orgid,
+       i.user_status::string as user_status,
+       i.user_type::string as user_type,
+       i.video_user,
+       i.chat_user,
+       i.calendar_only_user,
+       iff((case
+           when mb.userid is not null then 1
+           else 0
+        end) = 1, true, false)::boolean as meeting_booked_active,
+       ur.role_name as user_role,
+       dateadd(ms,u.createdat,'1970-01-01') as user_created_at,
+       u.email,
+       'false'::boolean as is_eu,
+       t.enabled_date as enabled_date,
+       t.first_page_activity as first_page_activity_date,
+       t.first_message_activity as first_message_activity_date,
+       t.enabled_sales_rep_date as enabled_sales_rep_date,
+       t.first_sales_seat_activity as first_sales_seat_activity,
+       t.first_sales_seat_activity_without_chat as first_sales_seat_activity_without_chat,
+       iff((CASE
+           WHEN dp.USER_ID is not null then 1
+           ELSE 0
+       END) = 1, true, false)::boolean AS page_view_active,
+       iff((CASE
+           WHEN dp7.user_id is not null then 1
+           ELSE 0
+       END) = 1, true, false)::boolean AS page_view_active_last_7_days
+FROM inter i
+left join SEGMENT.PRODUCT.DAU_PAGES dp
+  ON i.userid = dp.USER_ID
+  AND i.date = dp.date
+left join meeting_book_active_users mb
+  on i.userid = mb.userid
+  and i.date = mb.date
+ left join SEGMENT.PUBLIC.USERS u
+  on i.userid = u.id
+left join segment.product.user_roles ur on ur.userid = i.userid
+ left join Product.user_first_timestamp t
+ on i.userid=t.userid
+   left join segment.product.DAU_PAGES dp7
+     ON dateadd('day', -7, i.date) <= dp7.date
+     AND i.date >= dp7.date
+     AND i.userid = dp7.user_id
+WHERE i.orgid is not null);
