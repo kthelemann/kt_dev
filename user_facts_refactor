@@ -165,7 +165,8 @@ create or replace table product.user_facts_refactor as (
    FROM rowed_1 r
    cross join SEGMENT.AGGREGATED.DIM_CALENDAR cal
    WHERE cal.date >= '2016-01-01'),
-     inter AS
+
+inter AS
   (SELECT d.userid,
           d.date,
           COALESCE(orgid, lag(orgid, 1)
@@ -191,16 +192,27 @@ create or replace table product.user_facts_refactor as (
      ON d.userid = r.userid
      AND d.date = r.date
    WHERE d.date <= current_date()),
-     meeting_book_active_users AS
-  (SELECT CREATED_AT as date,
-          ATTRIBUTES:appointmentInfo:agentId AS userid,
-                                    count(distinct CONVERSATIONID)
-   FROM public.messages m
-   WHERE m.attributes like '%appointmentInfo%'
-     AND created_at >= dateadd('day', -29, current_date)
-   GROUP BY 1,
-            2)
-SELECT i.date::timestamp_ntz as date,
+
+meeting_book_active_users AS (
+SELECT 
+ CREATED_AT as date,
+ ATTRIBUTES:appointmentInfo:agentId AS userid,
+ count(distinct CONVERSATIONID)
+FROM public.messages m
+WHERE m.attributes like '%appointmentInfo%'
+AND created_at >= dateadd('day', -29, current_date)
+GROUP BY 1,2),
+
+last_page_view_date as (
+select distinct
+  user_id,
+  max(date) as last_page_view_date
+from segment.product.dau_pages
+group by 1
+)
+  
+SELECT DISTINCT 
+       i.date::timestamp_ntz as date,
        i.userid::number as userid,
        i.orgid::number as orgid,
        i.user_status::string as user_status,
@@ -217,6 +229,7 @@ SELECT i.date::timestamp_ntz as date,
        u.email,
        'false'::boolean as is_eu,
        t.enabled_date as enabled_date,
+       lpvd.last_page_view_date,
        t.first_page_activity as first_page_activity_date,
        t.first_message_activity as first_message_activity_date,
        t.enabled_sales_rep_date as enabled_sales_rep_date,
@@ -240,10 +253,11 @@ left join meeting_book_active_users mb
  left join SEGMENT.PUBLIC.USERS u
   on i.userid = u.id
 left join segment.product.user_roles ur on ur.userid = i.userid
- left join Product.user_first_timestamp t
+left join Product.user_first_timestamp t 
  on i.userid=t.userid
    left join segment.product.DAU_PAGES dp7
      ON dateadd('day', -7, i.date) <= dp7.date
      AND i.date >= dp7.date
      AND i.userid = dp7.user_id
+left join last_page_view_date lpvd on lpvd.user_id = i.userid
 WHERE i.orgid is not null);
