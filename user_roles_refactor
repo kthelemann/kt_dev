@@ -1,17 +1,18 @@
-create table product.user_roles as select * from
+create or replace table product.user_roles as select * from
 (
   (with rbac_users as (
   SELECT distinct
   u.orgid,
   p.objectid as userid,
   u.status,
+  try_cast(u.role as string) as role,
   case when p.name = 'rbac_user' then 1 else 0 end as rbac_user
   FROM SEGMENT.PUBLIC.PROPERTIES p
   left join segment.public.users u on u.id = p.objectid
   WHERE namespace = 'user-scopes'
   AND objectType = 'USER'
   AND value = 'true'
-  AND p.name = 'rbac_user'  
+  AND p.name = 'rbac_user'
   ),
 
   roles as (
@@ -19,9 +20,10 @@ create table product.user_roles as select * from
   ru.orgid,
   ru.userid,
   ru.status,
+  ru.role,
   u.roleid,
   ru.rbac_user,
-  r.name::string as role_name
+  r.name as role_name
   from rbac_users ru
   left join segment.public.user_roles u on u.userid = ru.userid
   left join segment.public.roles r on r.id = u.roleid
@@ -33,9 +35,12 @@ create table product.user_roles as select * from
   r.userid,
   r.status,
   r.rbac_user,
-  listagg(distinct r.role_name, ', ') within group (order by r.role_name) as role_name
+  r.role,
+ case when r.role = 'OWNER' then concat('Account Owner, ', listagg(distinct r.role_name, ', ') within group (order by r.role_name)) 
+       else listagg(distinct r.role_name, ', ') within group (order by r.role_name)
+       end as role_name
   from roles r
-  group by 1,2,3,4
+  group by 1,2,3,4,5
   )
   
   UNION ALL
@@ -45,6 +50,7 @@ create table product.user_roles as select * from
   u.orgid,
   p.objectid as userid,
   u.status,
+  try_cast(u.role as varchar) as role,
   u.name as user_name,
   null as rolid,
   case when p.name = 'rbac_user' then 1 else 0 end as rbac_user,
@@ -66,9 +72,11 @@ create table product.user_roles as select * from
   r.userid,
   r.status,
   r.rbac_user,
-  case when (listagg(distinct r.role_name, ', ') within group (order by r.role_name)) ilike '%admin%' then 'Admin' else (listagg(distinct r.role_name, ', ') within group (order by r.role_name)) end as role_name
+  r.role,
+  case when r.role = 'OWNER' then concat('Account Owner, ', listagg(distinct r.role_name, ', ') within group (order by r.role_name)) 
+       else listagg(distinct r.role_name, ', ') within group (order by r.role_name)
+      end as role_name
   from roles r
   left join segment.salesforce.accounts a on a.org_id_c = r.orgid
-  group by 1,2,3,4
-  ))
-  ;
+  group by 1,2,3,4,5
+  ));
